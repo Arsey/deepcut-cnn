@@ -17,7 +17,6 @@ import scipy as _scipy
 import logging as _logging
 import caffe as _caffe
 
-
 _LOGGER = _logging.getLogger(__name__)
 
 # Constants.
@@ -32,6 +31,41 @@ _STRIDE = 8.
 
 # CNN model store.
 _MODEL = None
+
+_PAD_SIZE = 64
+_SCALE_FACTOR = 1.
+
+
+def estimate_poses(images, model_def, model_bin, im_bg_width=600, im_bg_height=600):
+    global _MODEL
+    if _MODEL is None:
+        _MODEL = _caffe.Net(model_def, model_bin, _caffe.TEST)
+
+    net_input = []
+    for i in images:
+        im_bot_pixels = i[-1:, :, :]
+        im_bot = _np.tile(im_bot_pixels, (_PAD_SIZE, 1, 1))
+        image = _np.vstack((i, im_bot))
+
+        im_right_pixels = image[:, -1:, :]
+        im_right = _np.tile(im_right_pixels, (1, _PAD_SIZE, 1))
+        image = _np.hstack((image, im_right))
+
+        image = image.astype('float32') - _MEAN
+
+        placeholder = _np.zeros((im_bg_height, im_bg_width, 3), dtype='float32')
+        placeholder[:im_bg_height, :im_bg_width, :] = image[:im_bg_height, :im_bg_width, :]
+
+        net_input.append(placeholder)
+
+    poses = []
+    results = _process_images_tiled(_MODEL, net_input, _STRIDE, im_bg_width, im_bg_height)
+    for r in results:
+        unary_maps, locreg_pred = r
+        pose = _pose_from_mats(unary_maps, locreg_pred, scale=_SCALE_FACTOR)
+        poses.append(pose)
+
+    return poses
 
 
 def estimate_pose(image, model_def, model_bin, scales=None):  # pylint: disable=too-many-locals
@@ -98,9 +132,9 @@ def estimate_pose(image, model_def, model_bin, scales=None):  # pylint: disable=
 
         net_input = _np.zeros((im_bg_height, im_bg_width, 3), dtype='float32')
         net_input[:min(net_input.shape[0], image.shape[0]),
-                  :min(net_input.shape[1], image.shape[1]), :] =\
+        :min(net_input.shape[1], image.shape[1]), :] = \
             image[:min(net_input.shape[0], image.shape[0]),
-                  :min(net_input.shape[1], image.shape[1]), :]
+            :min(net_input.shape[1], image.shape[1]), :]
 
         _LOGGER.debug("Input shape: %d, %d.",
                       net_input.shape[0], net_input.shape[1])
@@ -154,6 +188,58 @@ def _get_num_tiles(length, max_size, rf):
             break
         k += 1
     return 2 + k
+
+
+def _process_images_tiled(model, net_input, stride, im_bg_width, im_bg_height):
+    """Get the CNN results for the tiled image."""
+    rf = 224  # Standard receptive field size.
+    cut_off = rf / stride
+
+    num_tiles_x = 1
+    num_tiles_y = 1
+
+    idx = 0
+
+    start_y = idx * (_MAX_SIZE - 2 * rf)
+    end_y = start_y + _MAX_SIZE
+
+    start_x = idx * (_MAX_SIZE - 2 * rf)
+    end_x = start_x + _MAX_SIZE
+    input_tile = _np.array(net_input)[:, start_y:end_y, start_x:end_x, :]
+
+    scoremaps_tiles, locreg_pred_tiles = _cnn_process_images(model, input_tile)
+    results = []
+    for k in range(input_tile.shape[0]):
+        scoremaps = []
+        locreg_pred = []
+        scoremaps_line = []
+        locreg_pred_line = []
+
+        scoremaps_tile = scoremaps_tiles[k]
+        locreg_pred_tile = locreg_pred_tiles[k]
+
+        scoremaps_tile = _cutoff_tile(scoremaps_tile, num_tiles_x, idx, cut_off, True)
+        locreg_pred_tile = _cutoff_tile(locreg_pred_tile, num_tiles_x, idx, cut_off, True)
+        scoremaps_tile = _cutoff_tile(scoremaps_tile, num_tiles_y, idx, cut_off, False)
+        locreg_pred_tile = _cutoff_tile(locreg_pred_tile, num_tiles_y, idx, cut_off, False)
+
+        scoremaps_line.append(scoremaps_tile)
+        locreg_pred_line.append(locreg_pred_tile)
+
+        scoremaps_line = _np.concatenate(scoremaps_line, axis=1)
+        locreg_pred_line = _np.concatenate(locreg_pred_line, axis=1)
+        scoremaps_line = _cutoff_tile(scoremaps_line, num_tiles_y, idx, cut_off, False)
+        locreg_pred_line = _cutoff_tile(locreg_pred_line, num_tiles_y, idx, cut_off, False)
+
+        scoremaps.append(scoremaps_line)
+        locreg_pred.append(locreg_pred_line)
+
+        scoremaps = _np.concatenate(scoremaps, axis=0)
+        locreg_pred = _np.concatenate(locreg_pred, axis=0)
+
+        results.append((scoremaps[:, :, 0, :], locreg_pred.transpose((0, 1, 3, 2))))
+
+    return results
 
 
 # pylint: disable=too-many-locals
@@ -219,6 +305,35 @@ def _process_image_tiled(model, net_input, stride):
     _LOGGER.debug("Final tiled shape: %s, %s.",
                   str(scoremaps.shape), str(locreg_pred.shape))
     return scoremaps[:, :, 0, :], locreg_pred.transpose((0, 1, 3, 2))
+
+
+def _cnn_process_images(model, net_input):
+    """Get the CNN results for a fully prepared image."""
+    model.blobs['data'].reshape(net_input.shape[0], 3, net_input[0].shape[0], net_input[0].shape[1])
+    for i in range(net_input.shape[0]):
+        img = net_input[i].transpose((2, 0, 1))
+        model.blobs['data'].data[i, ...] = img[...]
+    model.forward()
+
+    feat_probs = []
+    locreq_preds = []
+    for i in range(net_input.shape[0]):
+        feat_prob, locreg_pred = None, None
+
+        for outp_name in ['loc_pred', 'prob']:
+            out_value = _np.expand_dims(model.blobs[outp_name].data[i], axis=0)
+            if out_value.shape[1] == 14:
+                feat_prob = out_value.copy().transpose((2, 3, 0, 1))
+                continue
+            else:
+                out_value = out_value.reshape((14, 2, out_value.shape[2], out_value.shape[3]))
+                out_value = out_value.transpose((2, 3, 1, 0))
+                locreg_pred = out_value
+
+        feat_probs.append(feat_prob)
+        locreq_preds.append(locreg_pred)
+
+    return _np.array(feat_probs), _np.array(locreq_preds)
 
 
 def _cnn_process_image(model, net_input):
