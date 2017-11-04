@@ -36,9 +36,12 @@ _PAD_SIZE = 64
 _SCALE_FACTOR = 1.
 
 
-def estimate_poses(images, model_def, model_bin, im_bg_width=600, im_bg_height=600):
+def estimate_poses(images, model_def, model_bin, im_bg_width=600, im_bg_height=600, device_id=0):
     global _MODEL
+
     if _MODEL is None:
+        _caffe.set_mode_gpu()
+        _caffe.set_device(device_id)
         _MODEL = _caffe.Net(model_def, model_bin, _caffe.TEST)
 
     net_input = []
@@ -183,7 +186,7 @@ def _get_num_tiles(length, max_size, rf):
         return 1
     k = 0
     while True:
-        new_size = (max_size - rf) * 2 + (max_size - 2*rf) * k
+        new_size = (max_size - rf) * 2 + (max_size - 2 * rf) * k
         if new_size > length:
             break
         k += 1
@@ -257,7 +260,7 @@ def _process_image_tiled(model, net_input, stride):
     scoremaps = []
     locreg_pred = []
     for j in range(num_tiles_y):
-        start_y = j * (_MAX_SIZE - 2*rf)
+        start_y = j * (_MAX_SIZE - 2 * rf)
         if j == num_tiles_y:
             end_y = net_input.shape[0]
         else:
@@ -265,7 +268,7 @@ def _process_image_tiled(model, net_input, stride):
         scoremaps_line = []
         locreg_pred_line = []
         for i in range(num_tiles_x):
-            start_x = i * (_MAX_SIZE - 2*rf)
+            start_x = i * (_MAX_SIZE - 2 * rf)
             if i == num_tiles_x:
                 end_x = net_input.shape[1]
             else:
