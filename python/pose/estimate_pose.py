@@ -36,12 +36,15 @@ _PAD_SIZE = 64
 _SCALE_FACTOR = 1.
 
 
-def estimate_poses(images, model_def, model_bin, im_bg_width=600, im_bg_height=600, device_id=0):
+def estimate_poses(images, model_def, model_bin, im_bg_width=600, im_bg_height=600, device_id=0, mode='gpu'):
     global _MODEL
 
     if _MODEL is None:
-        _caffe.set_mode_gpu()
-        _caffe.set_device(device_id)
+        if mode == 'gpu':
+            _caffe.set_mode_gpu()
+            _caffe.set_device(device_id)
+        else:
+            _caffe.set_mode_cpu()
         _MODEL = _caffe.Net(model_def, model_bin, _caffe.TEST)
 
     net_input = []
